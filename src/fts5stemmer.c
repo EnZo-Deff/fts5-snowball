@@ -211,18 +211,30 @@ static int ftsSnowballCreate(void *pCtx, const char **azArg, int nArg, Fts5Token
     if (!result) return SQLITE_NOMEM;
     memset(result, 0, sizeof(struct SnowTokenizer));
 
-    // Строим отфильтрованный список аргументов без "override="
+    // nArg может быть 0 (tokenize='snowball'), а sqlite3_malloc(0) возвращает NULL
     int allocCount = (nArg > 0) ? nArg : 1;
     const char **filteredArg = sqlite3_malloc(allocCount * sizeof(char *));
-    if (!filteredArg) { sqlite3_free(result); return SQLITE_NOMEM; }
+    if (!filteredArg) {
+        sqlite3_free(result);
+        return SQLITE_NOMEM;
+    }
 
+    // Строим отфильтрованный список аргументов, вырезая пару "override <path>"
     int nFilteredArg = 0;
+    int skipNext = 0;
     for (int i = 0; i < nArg; i++) {
-        if (strncmp(azArg[i], "override=", 9) == 0) {
-            overridePath = azArg[i] + 9;
-        } else {
-            filteredArg[nFilteredArg++] = azArg[i];
+        if (skipNext) {
+            skipNext = 0;
+            continue; // это путь после "override" — уже сохранён, в filteredArg не нужен
         }
+        if (strcmp(azArg[i], "override") == 0) {
+            if (i + 1 < nArg) {
+                overridePath = azArg[i + 1];
+                skipNext = 1;
+            }
+            continue; // сам "override" тоже не добавляем
+        }
+        filteredArg[nFilteredArg++] = azArg[i];
     }
 
     rc = processListLanguages(filteredArg, nFilteredArg, &nextArg, result);
