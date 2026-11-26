@@ -2,6 +2,7 @@
 #include <sqlite3ext.h>
 #include <string.h>
 #include <stdio.h>
+#include <ctype.h>
 
 // Структура для одной пары переопределения
 struct StemOverride {
@@ -211,7 +212,8 @@ static int ftsSnowballCreate(void *pCtx, const char **azArg, int nArg, Fts5Token
     memset(result, 0, sizeof(struct SnowTokenizer));
 
     // Строим отфильтрованный список аргументов без "override="
-    const char **filteredArg = sqlite3_malloc(nArg * sizeof(char *));
+    int allocCount = (nArg > 0) ? nArg : 1;
+    const char **filteredArg = sqlite3_malloc(allocCount * sizeof(char *));
     if (!filteredArg) { sqlite3_free(result); return SQLITE_NOMEM; }
 
     int nFilteredArg = 0;
