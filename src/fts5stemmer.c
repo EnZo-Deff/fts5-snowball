@@ -1,9 +1,7 @@
 #include <libstemmer.h>
 #include <sqlite3ext.h>
 #include <string.h>
-
-// Максимальное количество переопределений
-#define MAX_OVERRIDES 256
+#include <stdio.h>
 
 // Структура для одной пары переопределения
 struct StemOverride {
@@ -141,18 +139,28 @@ static int loadOverridesFromFile(struct SnowTokenizer *snow, const char *path) {
     if (!f) return SQLITE_ERROR;
     char line[256];
     while (fgets(line, sizeof(line), f)) {
-        // Убираем перевод строки и комментарии
-        char *p = strchr(line, '\n');
-        if (p) *p = '\0';
+        // Убираем хвостовые \r, \n, пробелы и табы
+        char *p = line + strlen(line);
+        while (p > line && (p[-1] == '\n' || p[-1] == '\r' || p[-1] == ' ' || p[-1] == '\t')) {
+            *--p = '\0';
+        }
+        // Комментарии
         p = strchr(line, '#');
         if (p) *p = '\0';
+        // Хвостовые пробелы после удаления комментария
+        p = line + strlen(line);
+        while (p > line && (p[-1] == ' ' || p[-1] == '\t')) *--p = '\0';
         if (line[0] == '\0') continue;
 
         char *token = strtok(line, " \t");
         char *stem = strtok(NULL, " \t");
         if (token && stem) {
-            // Приводим токен к нижнему регистру (упрощённо)
-            for (char *c = token; *c; c++) *c = tolower(*c);
+            // Приведение к нижнему регистру — только для ASCII.
+            // Для кириллицы tolower() в C-локали не работает, поэтому
+            // токены в файле нужно писать сразу в нижнем регистре.
+            for (unsigned char *c = (unsigned char *)token; *c; c++) {
+                *c = (unsigned char)tolower(*c);
+            }
             int rc = addOverride(snow, token, stem);
             if (rc != SQLITE_OK) { fclose(f); return rc; }
         }
@@ -169,12 +177,20 @@ static void ftsSnowballDelete(Fts5Tokenizer *pTok) {
             for (int i = 0; p->stemmers[i] != NULL; i++) {
                 sb_stemmer_delete(p->stemmers[i]);
             }
-
             sqlite3_free(p->stemmers);
         }
 
         if (p->nextTokenizerInstance) {
             p->nextTokenizerModule.xDelete(p->nextTokenizerInstance);
+        }
+
+        // НОВОЕ: освобождаем переопределения
+        if (p->overrides) {
+            for (int i = 0; i < p->nOverrides; i++) {
+                sqlite3_free(p->overrides[i].token);
+                sqlite3_free(p->overrides[i].stem);
+            }
+            sqlite3_free(p->overrides);
         }
 
         sqlite3_free(p);
@@ -185,50 +201,58 @@ static int ftsSnowballCreate(void *pCtx, const char **azArg, int nArg, Fts5Token
     struct SnowTokenizer *result;
     fts5_api *pApi = (fts5_api *)pCtx;
     void *pUserdata = 0;
-    int rc = SQLITE_OK;
-    int nextArg;
+    int rc;
+    int nextArg = 0;
     const char *zBase = "unicode61";
+    const char *overridePath = NULL;
 
     result = (struct SnowTokenizer *)sqlite3_malloc(sizeof(struct SnowTokenizer));
+    if (!result) return SQLITE_NOMEM;
+    memset(result, 0, sizeof(struct SnowTokenizer));
 
-    if (result) {
-        memset(result, 0, sizeof(struct SnowTokenizer));
-        rc = processListLanguages(azArg, nArg, &nextArg, result);
-    } else {
-        rc = SQLITE_ERROR;
-    }
+    // Строим отфильтрованный список аргументов без "override="
+    const char **filteredArg = sqlite3_malloc(nArg * sizeof(char *));
+    if (!filteredArg) { sqlite3_free(result); return SQLITE_NOMEM; }
 
-    // Проверяем, есть ли аргумент "override"
-    const char *overridePath = NULL;
-    for (int i = nextArg; i < nArg; i++) {
+    int nFilteredArg = 0;
+    for (int i = 0; i < nArg; i++) {
         if (strncmp(azArg[i], "override=", 9) == 0) {
             overridePath = azArg[i] + 9;
-            // Можно удалить этот аргумент из списка или просто игнорировать при передаче дальше
-            break;
+        } else {
+            filteredArg[nFilteredArg++] = azArg[i];
         }
     }
+
+    rc = processListLanguages(filteredArg, nFilteredArg, &nextArg, result);
+    if (rc != SQLITE_OK) {
+        sqlite3_free(filteredArg);
+        ftsSnowballDelete((Fts5Tokenizer *)result);
+        *ppOut = NULL;
+        return rc;
+    }
+
     if (overridePath) {
-        int rc = loadOverridesFromFile(result, overridePath);
+        rc = loadOverridesFromFile(result, overridePath);
         if (rc != SQLITE_OK) {
-            // Если файл не загрузился, можно продолжить без переопределений или вернуть ошибку
-            // Лучше вернуть ошибку, чтобы пользователь знал
+            sqlite3_free(filteredArg);
             ftsSnowballDelete((Fts5Tokenizer *)result);
+            *ppOut = NULL;
             return rc;
         }
     }
-    
-    if (rc == SQLITE_OK) {
-        if (nArg > nextArg) {
-            zBase = azArg[nextArg];
-        }
-        rc = pApi->xFindTokenizer(pApi, zBase, &pUserdata, &result->nextTokenizerModule);
+
+    if (nFilteredArg > nextArg) {
+        zBase = filteredArg[nextArg];
     }
+    rc = pApi->xFindTokenizer(pApi, zBase, &pUserdata, &result->nextTokenizerModule);
 
     if (rc == SQLITE_OK) {
-        int nArg2 = (nArg > nextArg + 1 ? nArg - nextArg - 1 : 0);
-        const char **azArg2 = (nArg2 ? &azArg[nextArg + 1] : 0);
+        int nArg2 = (nFilteredArg > nextArg + 1 ? nFilteredArg - nextArg - 1 : 0);
+        const char **azArg2 = (nArg2 ? &filteredArg[nextArg + 1] : 0);
         rc = result->nextTokenizerModule.xCreate(pUserdata, azArg2, nArg2, &result->nextTokenizerInstance);
     }
+
+    sqlite3_free(filteredArg);
 
     if (rc != SQLITE_OK) {
         ftsSnowballDelete((Fts5Tokenizer *)result);
@@ -242,6 +266,14 @@ static int ftsSnowballCreate(void *pCtx, const char **azArg, int nArg, Fts5Token
 static int fts5SnowballCb(void *pCtx, int tflags, const char *pToken, int nToken, int iStart, int iEnd) {
     struct SnowTokenizer *p = (struct SnowTokenizer *)pCtx;
 
+    // 1. Сначала проверяем переопределение — до проверки длины,
+    //    чтобы короткие слова тоже можно было переопределить
+    const char *overrideStem = findOverride(p, pToken, nToken);
+    if (overrideStem) {
+        return p->xToken(p->pCtx, tflags, overrideStem, (int)strlen(overrideStem), iStart, iEnd);
+    }
+
+    // 2. Стандартная логика стемминга
     if (nToken > MAX_TOKEN_LEN || nToken <= MIN_TOKEN_LEN) {
         return p->xToken(p->pCtx, tflags, pToken, nToken, iStart, iEnd);
     } else {
@@ -260,6 +292,9 @@ static int fts5SnowballCb(void *pCtx, int tflags, const char *pToken, int nToken
             stemmer++;
         }
 
+        if (!stemmed) {
+            return p->xToken(p->pCtx, tflags, pToken, nToken, iStart, iEnd);
+        }
         return p->xToken(p->pCtx, tflags, (char *)stemmed, nBuf, iStart, iEnd);
     }
 }
